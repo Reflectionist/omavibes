@@ -361,6 +361,7 @@ Panel {
                                     Text {
                                         width: parent.width
                                         text: modelData.name
+                                        textFormat: Text.PlainText
                                         color: Color.popups.text
                                         font.family: root.uiFont
                                         font.pixelSize: 14
@@ -370,6 +371,7 @@ Panel {
                                     Text {
                                         width: parent.width
                                         text: modelData.path
+                                        textFormat: Text.PlainText
                                         color: Color.muted
                                         font.family: root.uiFont
                                         font.pixelSize: 10
@@ -539,6 +541,7 @@ Panel {
                                     anchors.verticalCenter: parent.verticalCenter
 
                                     text: root.formatPackName(modelData.name)
+                                    textFormat: Text.PlainText
 
                                     color: Color.popups.text
 
