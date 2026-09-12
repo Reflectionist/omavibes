@@ -2,20 +2,26 @@
 
 #include <linux/input-event-codes.h>
 
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <fcntl.h>
+#include <pwd.h>
+#include <unistd.h>
+
 #include <algorithm>
-#include <chrono>
+#include <atomic>
 #include <cerrno>
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
 #include <filesystem>
-#include <fstream>
 #include <iomanip>
 #include <map>
 #include <sstream>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace {
 using Clock = std::chrono::system_clock;
@@ -55,66 +61,318 @@ std::string jsonEscape(const std::string &value) {
   return out;
 }
 
+// State/config directories are only trusted when every directory component is
+// opened without following symlinks and has safe ownership/permissions.
+bool isSafeDirectory(const struct stat &st) {
+  if (!S_ISDIR(st.st_mode)) {
+    return false;
+  }
+
+  const uid_t currentUid = getuid();
+  if (st.st_uid != currentUid && st.st_uid != 0) {
+    return false;
+  }
+
+  // User-owned directories must not be group/other writable. Root-owned
+  // sticky directories such as /tmp are safe as intermediate components.
+  if ((st.st_mode & (S_IWGRP | S_IWOTH)) != 0) {
+    return st.st_uid == 0 && (st.st_mode & S_ISVTX) != 0;
+  }
+
+  return true;
+}
+
+bool statDirectoryFd(int fd) {
+  struct stat st{};
+  return fstat(fd, &st) == 0 && isSafeDirectory(st);
+}
+
+bool openSafeDirectory(const std::filesystem::path &path,
+                       bool createMissing,
+                       int &outFd) {
+  namespace fs = std::filesystem;
+
+  outFd = -1;
+
+  const bool absolute = path.is_absolute();
+  const int baseFlags = O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW;
+  int currentFd = open(absolute ? "/" : ".", baseFlags);
+  if (currentFd == -1 || !statDirectoryFd(currentFd)) {
+    if (currentFd != -1) {
+      close(currentFd);
+    }
+    return false;
+  }
+
+  try {
+    for (const fs::path &componentPath : path) {
+      const std::string component = componentPath.string();
+
+      if (component.empty() || component == "/" || component == ".") {
+        continue;
+      }
+
+      // Never allow traversal outside the trusted directory walk.
+      if (component == "..") {
+        close(currentFd);
+        return false;
+      }
+
+      int nextFd = openat(
+          currentFd,
+          component.c_str(),
+          baseFlags);
+
+      if (nextFd == -1 && errno == ENOENT && createMissing) {
+        if (mkdirat(currentFd, component.c_str(), 0700) != 0 &&
+            errno != EEXIST) {
+          close(currentFd);
+          return false;
+        }
+
+        nextFd = openat(
+            currentFd,
+            component.c_str(),
+            baseFlags);
+      }
+
+      if (nextFd == -1 || !statDirectoryFd(nextFd)) {
+        if (nextFd != -1) {
+          close(nextFd);
+        }
+        close(currentFd);
+        return false;
+      }
+
+      close(currentFd);
+      currentFd = nextFd;
+    }
+  } catch (...) {
+    close(currentFd);
+    return false;
+  }
+
+  outFd = currentFd;
+  return true;
+}
+
+bool splitTargetPath(const std::string &path,
+                     std::filesystem::path &parent,
+                     std::string &filename) {
+  namespace fs = std::filesystem;
+
+  if (path.empty()) {
+    return false;
+  }
+
+  const fs::path target(path);
+  parent = target.parent_path();
+  filename = target.filename().string();
+
+  if (filename.empty() || filename == "." || filename == "..") {
+    return false;
+  }
+
+  return true;
+}
+
 std::string readFile(const std::string &path) {
-  std::ifstream file(path);
-  if (!file.is_open()) {
+  namespace fs = std::filesystem;
+
+  fs::path parent;
+  std::string filename;
+  if (!splitTargetPath(path, parent, filename)) {
     return {};
   }
 
-  std::ostringstream buffer;
-  buffer << file.rdbuf();
-  return buffer.str();
+  int dirFd = -1;
+  if (!openSafeDirectory(parent, false, dirFd)) {
+    return {};
+  }
+
+  const int fd = openat(
+      dirFd,
+      filename.c_str(),
+      O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+  close(dirFd);
+
+  if (fd == -1) {
+    return {};
+  }
+
+  struct stat st{};
+  if (fstat(fd, &st) != 0 ||
+      !S_ISREG(st.st_mode) ||
+      st.st_uid != getuid() ||
+      (st.st_mode & (S_IWGRP | S_IWOTH)) != 0) {
+    close(fd);
+    return {};
+  }
+
+  std::string result;
+  char buffer[8192];
+
+  while (true) {
+    const ssize_t count = read(fd, buffer, sizeof(buffer));
+
+    if (count < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      close(fd);
+      return {};
+    }
+
+    if (count == 0) {
+      break;
+    }
+
+    result.append(buffer, static_cast<std::size_t>(count));
+  }
+
+  close(fd);
+  return result;
 }
 
-bool writeFileAtomically(const std::string &path, const std::string &data) {
+std::string makeTempName(const std::string &targetName,
+                         std::size_t attempt) {
+  static std::atomic<unsigned long long> counter{0};
+  const unsigned long long sequence = counter.fetch_add(1);
+
+  std::ostringstream name;
+  name << "." << targetName
+       << ".tmp-" << static_cast<unsigned long long>(getpid())
+       << "-" << sequence
+       << "-" << attempt;
+  return name.str();
+}
+
+int createExclusiveTemp(int dirFd,
+                        const std::string &targetName,
+                        std::string &tempName) {
+  constexpr std::size_t kAttempts = 64;
+
+  for (std::size_t attempt = 0; attempt < kAttempts; ++attempt) {
+    tempName = makeTempName(targetName, attempt);
+
+    const int fd = openat(
+        dirFd,
+        tempName.c_str(),
+        O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+        0600);
+
+    if (fd >= 0) {
+      return fd;
+    }
+
+    if (errno != EEXIST) {
+      break;
+    }
+  }
+
+  tempName.clear();
+  return -1;
+}
+
+bool writeFileAtomically(const std::string &path,
+                         const std::string &data) {
   namespace fs = std::filesystem;
 
   try {
-    const fs::path target(path);
-    const fs::path parent = target.parent_path();
-
-    if (!parent.empty()) {
-      fs::create_directories(parent);
-    }
-
-    const fs::path temp = target.string() + ".tmp";
-
-    {
-      std::ofstream file(temp, std::ios::out | std::ios::trunc);
-      if (!file.is_open()) {
-        return false;
-      }
-
-      file << data;
-      file.flush();
-
-      if (!file.good()) {
-        file.close();
-        std::error_code ignored;
-        fs::remove(temp, ignored);
-        return false;
-      }
-    }
-
-    std::error_code error;
-    fs::rename(temp, target, error);
-
-    if (error) {
-      // Some filesystems don't replace an existing file with rename().
-      fs::remove(target, error);
-      fs::rename(temp, target, error);
-    }
-
-    if (error) {
-      fs::remove(temp, error);
+    fs::path parent;
+    std::string targetName;
+    if (!splitTargetPath(path, parent, targetName)) {
       return false;
     }
 
-    return true;
+    int dirFd = -1;
+    if (!openSafeDirectory(parent, true, dirFd)) {
+      return false;
+    }
+
+    std::string tempName;
+    const int fd = createExclusiveTemp(dirFd, targetName, tempName);
+    if (fd == -1) {
+      close(dirFd);
+      return false;
+    }
+
+    bool success = false;
+    bool fdClosed = false;
+
+    do {
+      if (fchmod(fd, 0600) != 0) {
+        break;
+      }
+
+      const char *buffer = data.data();
+      std::size_t remaining = data.size();
+
+      while (remaining > 0) {
+        const ssize_t written = write(fd, buffer, remaining);
+
+        if (written < 0) {
+          if (errno == EINTR) {
+            continue;
+          }
+          break;
+        }
+
+        if (written == 0) {
+          break;
+        }
+
+        buffer += written;
+        remaining -= static_cast<std::size_t>(written);
+      }
+
+      if (remaining != 0) {
+        break;
+      }
+
+      if (fsync(fd) != 0) {
+        break;
+      }
+
+      if (close(fd) != 0) {
+        fdClosed = true;
+        break;
+      }
+      fdClosed = true;
+
+      if (renameat(dirFd,
+                   tempName.c_str(),
+                   dirFd,
+                   targetName.c_str()) != 0) {
+        break;
+      }
+
+      // Persist the directory entry update as well as the file contents.
+      if (fsync(dirFd) != 0) {
+        // The rename already happened. Report failure conservatively so the
+        // caller will retry later, but never try to rename the temp again.
+        break;
+      }
+
+      success = true;
+    } while (false);
+
+    if (!fdClosed) {
+      close(fd);
+    }
+
+    if (!success) {
+      // If renameat already succeeded, unlinkat simply returns ENOENT.
+      unlinkat(dirFd, tempName.c_str(), 0);
+    }
+
+    close(dirFd);
+    return success;
   } catch (...) {
     return false;
   }
 }
+
 
 std::string extractObject(const std::string &json,
                           const std::string &key) {
@@ -598,19 +856,36 @@ AnalyticsTracker::~AnalyticsTracker() {
 std::string AnalyticsTracker::defaultStatePath() {
   const char *xdgStateHome = std::getenv("XDG_STATE_HOME");
 
-  if (xdgStateHome && *xdgStateHome) {
+  if (xdgStateHome && *xdgStateHome && xdgStateHome[0] == '/') {
     return std::string(xdgStateHome) +
            "/omarchy/omavibes-analytics.json";
   }
 
-  const char *home = std::getenv("HOME");
+  // Do not trust HOME for security-sensitive state paths. Resolve the real
+  // home directory from the account database instead.
+  const long configuredSize = sysconf(_SC_GETPW_R_SIZE_MAX);
+  const std::size_t bufferSize =
+      configuredSize > 0 ? static_cast<std::size_t>(configuredSize) : 16384U;
 
-  if (home && *home) {
-    return std::string(home) +
+  std::vector<char> buffer(bufferSize);
+  struct passwd passwordEntry{};
+  struct passwd *result = nullptr;
+
+  if (getpwuid_r(getuid(),
+                 &passwordEntry,
+                 buffer.data(),
+                 buffer.size(),
+                 &result) == 0 &&
+      result &&
+      result->pw_dir &&
+      result->pw_dir[0] == '/') {
+    return std::string(result->pw_dir) +
            "/.local/state/omarchy/omavibes-analytics.json";
   }
 
-  return ".local/state/omarchy/omavibes-analytics.json";
+  // Returning an empty path disables persistence rather than falling back to
+  // an attacker-controlled working directory.
+  return {};
 }
 
 void AnalyticsTracker::setEnabled(bool enabled) {

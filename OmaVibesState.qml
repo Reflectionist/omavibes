@@ -29,6 +29,7 @@ QtObject {
         { name: "Chalks",                               folder: "chalks" },
         { name: "eg oreo",                              folder: "eg-oreo" },
         { name: "Lincoln Typewriter",                   folder: "Lincoln Typewriter" },
+        { name: "gx-verdock",                           folder: "gx-verdock" },
         { name: "Razer Green (Blackwidow Elite)",       folder: "Razer Green (Blackwidow Elite) - Akira" },
         { name: "penumbra",                             folder: "penumbra" },
         { name: "Thocks",                               folder: "Thocks" },
@@ -57,7 +58,17 @@ QtObject {
         { name: "Sword",                                folder: "Sword" },
         { name: "8 bit",                                folder: "8 bit" },
         { name: "Glass",                                folder: "Glass" },
-        { name: "Fight",                                folder: "Fight" }
+        { name: "Fight",                                folder: "Fight" },
+        { name: "topre",                                folder: "topre" },
+        { name: "novelkeys-cream",                      folder: "novelkeys-cream" },
+        { name: "kailh-box-navy",                       folder: "kailh-box-navy" },
+        { name: "IBM-buckling-spring",                  folder: "IBM-buckling-spring" },
+        { name: "gateron-turquoise-tealios",            folder: "gateron-turquoise-tealios" },
+        { name: "gateron-ink-red",                      folder: "gateron-ink-red" },
+        { name: "gateron-ink-black",                    folder: "gateron-ink-black" },
+        { name: "durock-alpaca",                        folder: "durock-alpaca" },
+        { name: "drop-holy-panda",                      folder: "drop-holy-panda" },
+        { name: "alps-skcm-blue",                       folder: "alps-skcm-blue" }
     ]
 
     property string currentPack: ""
